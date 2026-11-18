@@ -12,7 +12,7 @@ db = SQLAlchemy(app)
 
 # आपका आधिकारिक टेलीग्राम बॉट टोकन
 TELEGRAM_BOT_TOKEN = "8970811998:AAG1pkIq7zWS1fZlnjN6vTMBviZ4xWKKtOc"  
-ADMIN_CHAT_ID = "YOUR_ADMIN_CHAT_ID"     # यहाँ अपनी टेलीग्राम चैट आईडी डालें (जैसे: 123456789)
+ADMIN_CHAT_ID = "YOUR_ADMIN_CHAT_ID"     # यहाँ अपनी टेलीग्राम चैट आईडी डाल सकते हैं (वैकल्पिक)
 
 # 1. User Model - यूजर्स और उनके ब्लॉक स्टेटस के लिए
 class User(db.Model):
@@ -35,13 +35,18 @@ class Message(db.Model):
 with app.app_context():
     db.create_all()
 
-# 🌐 होमपेज राउट (ब्राउज़र में https://rendar-ud3i.onrender.com खोलने पर 404 नहीं आएगा)
+# 🌐 होमपेज राउट (ब्राउज़र में लिंक खोलने पर 200 OK देने के लिए)
 @app.route('/', methods=['GET'])
 def home():
     return "Hello Sir Backend is Live and Running successfully!"
 
-# यूजर रजिस्ट्रेशन और लिस्ट अपडेट राउट (404 एरर को पूरी तरह खत्म करने के लिए)
-@app.route('/register', methods=['POST'])
+# 🩺 हेल्थ चेक राउट
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    return jsonify({"status": "healthy", "message": "Backend is running fine"})
+
+# 👤 यूजर रजिस्ट्रेशन राउट (ऐप के ApiService से सटीक मैच)
+@app.route('/api/users/register', methods=['POST'])
 def register_user():
     data = request.json or {}
     uid = data.get('user_id')
@@ -55,16 +60,28 @@ def register_user():
         new_user = User(user_id=uid, name=name)
         db.session.add(new_user)
         db.session.commit()
-        # जैसे ही कोई नया यूजर रजिस्टर हो, टेलीग्राम पर अलर्ट जाए
+        # जैसे ही नया यूजर रजिस्टर हो, टेलीग्राम पर अलर्ट जाए
         if ADMIN_CHAT_ID != "YOUR_ADMIN_CHAT_ID":
             requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
                 "chat_id": ADMIN_CHAT_ID,
                 "text": f"👤 **नया यूजर रजिस्टर्ड हुआ!**\nनाम: {name}\nयूजर आईडी: {uid}"
             })
-    return jsonify({"status": "registered"})
+    return jsonify({"status": "registered", "user_id": uid, "name": name})
 
-# मैसेज भेजने और टेलीग्राम पर फॉरवर्ड करने का राउट
-@app.route('/send_message', methods=['POST'])
+# 📋 यूजर डायरेक्टरी राउट
+@app.route('/api/users', methods=['GET'])
+def get_user_directory():
+    users = User.query.all()
+    users_list = [{"user_id": u.user_id, "name": u.name, "is_blocked": u.is_blocked} for u in users]
+    return jsonify({"users": users_list})
+
+# 🔔 एडमिन वेबहुक इवेंट राउट
+@app.route('/api/webhooks/admin-event', methods=['POST'])
+def admin_webhook_event():
+    return jsonify({"status": "success"})
+
+# 📩 मैसेज भेजने और टेलीग्राम पर फॉरवर्ड करने का राउट (ऐप के ApiService से सटीक मैच)
+@app.route('/api/messages', methods=['POST'])
 def send_message():
     data = request.json or {}
     sender = data.get('sender_id')
@@ -102,9 +119,63 @@ def send_message():
             }
         })
 
+    return jsonify({
+        "id": str(new_msg.id),
+        "sender_id": sender,
+        "receiver_id": receiver,
+        "message": msg_text,
+        "media_url": media,
+        "timestamp": str(new_msg.timestamp),
+        "is_read": new_msg.is_read
+    })
+
+# 📜 चैट हिस्ट्री देखने का राउट
+@app.route('/api/messages/<peer_id>', methods=['GET'])
+def get_messages(peer_id):
+    current_user_id = request.args.get('userId')
+    messages = Message.query.filter(
+        ((Message.sender_id == current_user_id) & (Message.receiver_id == peer_id)) |
+        ((Message.sender_id == peer_id) & (Message.receiver_id == current_user_id))
+    ).all()
+
+    msgs_list = [{
+        "id": str(m.id),
+        "sender_id": m.sender_id,
+        "receiver_id": m.receiver_id,
+        "message": m.message,
+        "media_url": m.media_url,
+        "timestamp": str(m.timestamp),
+        "is_read": m.is_read
+    } for m in messages]
+
+    return jsonify({"messages": msgs_list})
+
+# 🗑️ मैसेज डिलीट करने का राउट
+@app.route('/api/messages/<message_id>', methods=['DELETE'])
+def delete_message(message_id):
+    msg = Message.query.get(message_id)
+    if msg:
+        db.session.delete(msg)
+        db.session.commit()
+        return jsonify({"status": "success"})
+    return jsonify({"error": "Message not found"}), 404
+
+# ✔️ मैसेज रीड करने का राउट
+@app.route('/api/messages/<peer_id>/read', methods=['POST'])
+def mark_conversation_read(peer_id):
     return jsonify({"status": "success"})
 
-# टेलीग्राम से जब एडमिन कमांड भेजे या यूजर की हिस्ट्री माँगे
+# 📁 मीडिया अपलोड राउट
+@app.route('/api/media/upload', methods=['POST'])
+def upload_media():
+    return jsonify({"media_url": "https://placeholder-url.com/media.jpg", "type": "image"})
+
+# 🌐 WebRTC ICE Servers राउट
+@app.route('/api/webrtc/ice-servers', methods=['GET'])
+def get_ice_servers():
+    return jsonify({"ice_servers": []})
+
+# 🤖 टेलीग्राम वेबहुक (ब्लॉक/अनब्लॉक बटन और /history कमांड के लिए)
 @app.route('/telegram_webhook', methods=['POST'])
 def telegram_webhook():
     update = request.json or {}

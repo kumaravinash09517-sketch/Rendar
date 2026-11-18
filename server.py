@@ -10,8 +10,9 @@ app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///chat_app.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-TELEGRAM_BOT_TOKEN = "8970811998:AAG1pkIq7zWS1fZlnjN6vTMBviZ4xWKKtOc"  # आपका टेलीग्राम बॉट टोकन
-ADMIN_CHAT_ID = "YOUR_ADMIN_CHAT_ID"     # यहाँ अपनी टेलीग्राम चैट आईडी डालें
+# आपका आधिकारिक टेलीग्राम बॉट टोकन
+TELEGRAM_BOT_TOKEN = "8970811998:AAG1pkIq7zWS1fZlnjN6vTMBviZ4xWKKtOc"  
+ADMIN_CHAT_ID = "YOUR_ADMIN_CHAT_ID"     # यहाँ अपनी टेलीग्राम चैट आईडी डालें (जैसे: 123456789)
 
 # 1. User Model - यूजर्स और उनके ब्लॉक स्टेटस के लिए
 class User(db.Model):
@@ -34,18 +35,21 @@ class Message(db.Model):
 with app.app_context():
     db.create_all()
 
-# 🌐 नया होमपेज राउट (ताकि ब्राउज़र में खोलने पर 404 न आए)
+# 🌐 होमपेज राउट (ब्राउज़र में https://rendar-ud3i.onrender.com खोलने पर 404 नहीं आएगा)
 @app.route('/', methods=['GET'])
 def home():
     return "Hello Sir Backend is Live and Running successfully!"
 
-# यूजर रजिस्ट्रेशन और लिस्ट अपडेट राउट
+# यूजर रजिस्ट्रेशन और लिस्ट अपडेट राउट (404 एरर को पूरी तरह खत्म करने के लिए)
 @app.route('/register', methods=['POST'])
 def register_user():
-    data = request.json
+    data = request.json or {}
     uid = data.get('user_id')
     name = data.get('name')
     
+    if not uid or not name:
+        return jsonify({"error": "Missing user_id or name"}), 400
+
     user = User.query.filter_by(user_id=uid).first()
     if not user:
         new_user = User(user_id=uid, name=name)
@@ -62,16 +66,16 @@ def register_user():
 # मैसेज भेजने और टेलीग्राम पर फॉरवर्ड करने का राउट
 @app.route('/send_message', methods=['POST'])
 def send_message():
-    data = request.json
+    data = request.json or {}
     sender = data.get('sender_id')
     receiver = data.get('receiver_id')
     msg_text = data.get('message')
     media = data.get('media_url', None)
 
-    # चेक करें कि यूजर ब्लॉक तो नहीं है
+    # चेक करें कि यूजर ब्लॉक तो नहीं है (HTTP 403 Forbidden हैंडलिंग)
     user_check = User.query.filter_by(user_id=sender).first()
     if user_check and user_check.is_blocked:
-        return jsonify({"error": "You are blocked by admin"}), 403
+        return jsonify({"error": "You are blocked by the administrator."}), 403
 
     # डेटाबेस में परमानेंट सेव करें
     new_msg = Message(sender_id=sender, receiver_id=receiver, message=msg_text, media_url=media)
@@ -103,38 +107,39 @@ def send_message():
 # टेलीग्राम से जब एडमिन कमांड भेजे या यूजर की हिस्ट्री माँगे
 @app.route('/telegram_webhook', methods=['POST'])
 def telegram_webhook():
-    update = request.json
+    update = request.json or {}
     if "callback_query" in update:
         callback = update["callback_query"]
         data = callback["data"]
         chat_id = callback["message"]["chat"]["id"]
         
         parts = data.split("_")
-        action = parts[0] + "_" + parts[1]
-        target_user = parts[2]
-        
-        user = User.query.filter_by(user_id=target_user).first()
-        if user:
-            if action == "perm_block":
-                user.is_blocked = True
-                user.block_type = "permanent"
-                msg = f"🚫 यूजर {target_user} को परमानेंट ब्लॉक कर दिया गया है।"
-            elif action == "temp_block":
-                user.is_blocked = True
-                user.block_type = "temporary"
-                msg = f"⏱️ यूजर {target_user} को कुछ समय के लिए ब्लॉक कर दिया गया है।"
-            elif action == "unblock":
-                user.is_blocked = False
-                user.block_type = "none"
-                msg = f"✅ यूजर {target_user} को अनब्लॉक कर दिया गया है।"
-            db.session.commit()
-        else:
-            msg = "यूजर नहीं मिला।"
+        if len(parts) >= 3:
+            action = parts[0] + "_" + parts[1]
+            target_user = parts[2]
+            
+            user = User.query.filter_by(user_id=target_user).first()
+            if user:
+                if action == "perm_block":
+                    user.is_blocked = True
+                    user.block_type = "permanent"
+                    msg = f"🚫 यूजर {target_user} को परमानेंट ब्लॉक कर दिया गया है।"
+                elif action == "temp_block":
+                    user.is_blocked = True
+                    user.block_type = "temporary"
+                    msg = f"⏱️ यूजर {target_user} को कुछ समय के लिए ब्लॉक कर दिया गया है।"
+                elif action == "unblock":
+                    user.is_blocked = False
+                    user.block_type = "none"
+                    msg = f"✅ यूजर {target_user} को अनब्लॉक कर दिया गया है।"
+                db.session.commit()
+            else:
+                msg = "यूजर नहीं मिला।"
 
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-            "chat_id": chat_id,
-            "text": msg
-        })
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+                "chat_id": chat_id,
+                "text": msg
+            })
 
     elif "message" in update:
         text = update["message"].get("text", "")

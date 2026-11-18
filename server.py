@@ -5,12 +5,12 @@ import requests
 
 app = Flask(__name__)
 
-# SQLite Database Setup - चैट और यूजर डेटा हमेशा सुरक्षित रखने के लिए
+# SQLite Database Setup - चैट और यूजर डेटा सुरक्षित रखने के लिए
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///chat_app.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN"  # यहाँ अपना टेलीग्राम बॉट टोकन डालें
+TELEGRAM_BOT_TOKEN = "8970811998:AAG1pkIq7zWS1fZlnjN6vTMBviZ4xWKKtOc"  # आपका टेलीग्राम बॉट टोकन
 ADMIN_CHAT_ID = "YOUR_ADMIN_CHAT_ID"     # यहाँ अपनी टेलीग्राम चैट आईडी डालें
 
 # 1. User Model - यूजर्स और उनके ब्लॉक स्टेटस के लिए
@@ -34,6 +34,11 @@ class Message(db.Model):
 with app.app_context():
     db.create_all()
 
+# 🌐 नया होमपेज राउट (ताकि ब्राउज़र में खोलने पर 404 न आए)
+@app.route('/', methods=['GET'])
+def home():
+    return "Hello Sir Backend is Live and Running successfully!"
+
 # यूजर रजिस्ट्रेशन और लिस्ट अपडेट राउट
 @app.route('/register', methods=['POST'])
 def register_user():
@@ -47,10 +52,11 @@ def register_user():
         db.session.add(new_user)
         db.session.commit()
         # जैसे ही कोई नया यूजर रजिस्टर हो, टेलीग्राम पर अलर्ट जाए
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-            "chat_id": ADMIN_CHAT_ID,
-            "text": f"👤 **नया यूजर रजिस्टर्ड हुआ!**\nनाम: {name}\nयूजर आईडी: {uid}"
-        })
+        if ADMIN_CHAT_ID != "YOUR_ADMIN_CHAT_ID":
+            requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+                "chat_id": ADMIN_CHAT_ID,
+                "text": f"👤 **नया यूजर रजिस्टर्ड हुआ!**\nनाम: {name}\nयूजर आईडी: {uid}"
+            })
     return jsonify({"status": "registered"})
 
 # मैसेज भेजने और टेलीग्राम पर फॉरवर्ड करने का राउट
@@ -73,23 +79,24 @@ def send_message():
     db.session.commit()
 
     # टेलीग्राम पर चैट और ब्लॉक बटन भेजना
-    tg_text = f"📩 **नया मैसेज आया:**\n👤 यूजर आईडी: `{sender}`\n💬 मैसेज: {msg_text}"
-    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-        "chat_id": ADMIN_CHAT_ID,
-        "text": tg_text,
-        "parse_mode": "Markdown",
-        "reply_markup": {
-            "inline_keyboard": [
-                [
-                    {"text": "🚫 Permanent Block", "callback_data": f"perm_block_{sender}"},
-                    {"text": "⏱️ Temp Block", "callback_data": f"temp_block_{sender}"}
-                ],
-                [
-                    {"text": "✅ Unblock", "callback_data": f"unblock_{sender}"}
+    if ADMIN_CHAT_ID != "YOUR_ADMIN_CHAT_ID":
+        tg_text = f"📩 **नया मैसेज आया:**\n👤 यूजर आईडी: `{sender}`\n💬 मैसेज: {msg_text}"
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
+            "chat_id": ADMIN_CHAT_ID,
+            "text": tg_text,
+            "parse_mode": "Markdown",
+            "reply_markup": {
+                "inline_keyboard": [
+                    [
+                        {"text": "🚫 Permanent Block", "callback_data": f"perm_block_{sender}"},
+                        {"text": "⏱️ Temp Block", "callback_data": f"temp_block_{sender}"}
+                    ],
+                    [
+                        {"text": "✅ Unblock", "callback_data": f"unblock_{sender}"}
+                    ]
                 ]
-            ]
-        }
-    })
+            }
+        })
 
     return jsonify({"status": "success"})
 
@@ -98,13 +105,12 @@ def send_message():
 def telegram_webhook():
     update = request.json
     if "callback_query" in update:
-        # ब्लॉक/अनब्लॉक बटन का रिस्पॉन्स हैंडल करना
         callback = update["callback_query"]
         data = callback["data"]
         chat_id = callback["message"]["chat"]["id"]
         
         parts = data.split("_")
-        action = parts[0] + "_" + parts[1] # perm_block, temp_block या unblock
+        action = parts[0] + "_" + parts[1]
         target_user = parts[2]
         
         user = User.query.filter_by(user_id=target_user).first()
@@ -134,7 +140,6 @@ def telegram_webhook():
         text = update["message"].get("text", "")
         chat_id = update["message"]["chat"]["id"]
         
-        # अगर टेलीग्राम पर कमांड दें: /history <userid>
         if text.startswith("/history"):
             parts = text.split(" ")
             if len(parts) > 1:
@@ -153,14 +158,9 @@ def telegram_webhook():
                     "text": history_text,
                     "parse_mode": "Markdown"
                 })
-            else:
-                requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={
-                    "chat_id": chat_id,
-                    "text": "कृपया सही फॉर्मेट इस्तेमाल करें, जैसे: `/history sos1`",
-                    "parse_mode": "Markdown"
-                })
 
     return jsonify({"status": "ok"})
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)

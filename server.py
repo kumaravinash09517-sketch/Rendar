@@ -12,7 +12,7 @@ db = SQLAlchemy(app)
 
 # आपका आधिकारिक टेलीग्राम बॉट टोकन
 TELEGRAM_BOT_TOKEN = "8970811998:AAG1pkIq7zWS1fZlnjN6vTMBviZ4xWKKtOc"  
-ADMIN_CHAT_ID = "YOUR_ADMIN_CHAT_ID"     # यहाँ अपनी टेलीग्राम चैट आईडी डाल सकते हैं (वैकल्पिक)
+ADMIN_CHAT_ID = "7743339724"     # यहाँ अपनी टेलीग्राम चैट आईडी डाल सकते हैं (वैकल्पिक)
 
 # 1. User Model - यूजर्स और उनके ब्लॉक स्टेटस के लिए
 class User(db.Model):

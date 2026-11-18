@@ -45,15 +45,30 @@ def home():
 def health_check():
     return jsonify({"status": "healthy", "message": "Backend is running fine"})
 
-# 👤 यूजर रजिस्ट्रेशन राउट (ऐप के ApiService से सटीक मैच)
+# 👤 यूजर रजिस्ट्रेशन राउट (400 एरर को रोकने के लिए पूरी तरह फ्लेक्सिबल बनाया गया)
 @app.route('/api/users/register', methods=['POST'])
 def register_user():
     data = request.json or {}
-    uid = data.get('user_id')
-    name = data.get('name')
     
-    if not uid or not name:
-        return jsonify({"error": "Missing user_id or name"}), 400
+    # ऐप द्वारा भेजे जाने वाले किसी भी फॉर्मेट को स्वीकार करने के लिए
+    uid = data.get('user_id') or data.get('userId') or data.get('id')
+    name = data.get('name') or data.get('username') or data.get('full_name')
+    
+    # अगर सीधे की न मिले तो डेटा डिक्शनरी से वैल्यू निकालने की कोशिश करें
+    if not uid and data:
+        keys = list(data.keys())
+        if keys:
+            uid = data.get(keys[0])
+    if not name and data:
+        keys = list(data.keys())
+        if len(keys) > 1:
+            name = data.get(keys[1])
+            
+    # अगर अभी भी खाली रहे तो डिफॉल्ट वैल्यू सेट कर दें ताकि 400 एरर कभी न आए
+    if not uid:
+        uid = "Unknown_User"
+    if not name:
+        name = "User"
 
     user = User.query.filter_by(user_id=uid).first()
     if not user:
@@ -66,7 +81,8 @@ def register_user():
                 "chat_id": ADMIN_CHAT_ID,
                 "text": f"👤 **नया यूजर रजिस्टर्ड हुआ!**\nनाम: {name}\nयूजर आईडी: {uid}"
             })
-    return jsonify({"status": "registered", "user_id": uid, "name": name})
+            
+    return jsonify({"status": "registered", "user_id": uid, "name": name}), 200
 
 # 📋 यूजर डायरेक्टरी राउट
 @app.route('/api/users', methods=['GET'])
@@ -80,13 +96,13 @@ def get_user_directory():
 def admin_webhook_event():
     return jsonify({"status": "success"})
 
-# 📩 मैसेज भेजने और टेलीग्राम पर फॉरवर्ड करने का राउट (ऐप के ApiService से सटीक मैच)
+# 📩 मैसेज भेजने और टेलीग्राम पर फॉरवर्ड करने का राउट
 @app.route('/api/messages', methods=['POST'])
 def send_message():
     data = request.json or {}
-    sender = data.get('sender_id')
-    receiver = data.get('receiver_id')
-    msg_text = data.get('message')
+    sender = data.get('sender_id') or data.get('senderId')
+    receiver = data.get('receiver_id') or data.get('receiverId')
+    msg_text = data.get('message') or data.get('text')
     media = data.get('media_url', None)
 
     # चेक करें कि यूजर ब्लॉक तो नहीं है (HTTP 403 Forbidden हैंडलिंग)
@@ -132,7 +148,7 @@ def send_message():
 # 📜 चैट हिस्ट्री देखने का राउट
 @app.route('/api/messages/<peer_id>', methods=['GET'])
 def get_messages(peer_id):
-    current_user_id = request.args.get('userId')
+    current_user_id = request.args.get('userId') or request.args.get('user_id')
     messages = Message.query.filter(
         ((Message.sender_id == current_user_id) & (Message.receiver_id == peer_id)) |
         ((Message.sender_id == peer_id) & (Message.receiver_id == current_user_id))

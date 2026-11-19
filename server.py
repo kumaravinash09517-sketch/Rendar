@@ -1,6 +1,7 @@
 import os
+import re
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 import requests
@@ -12,17 +13,28 @@ app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///chat_app.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-# आपका आधिकारिक टेलीग्राम बॉट टोकन और आपकी चैट आईडी
-TELEGRAM_BOT_TOKEN = "8970811998:AAG1pkIq7zWS1fZlnjN6vTMBviZ4xWKKtOc"
-ADMIN_CHAT_ID = "7743339724"
+# आपका आधिकारिक टेलीग्राम बॉट टोकन, बॉट यूजरनेम और आपकी चैट आईडी
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8970811998:AAG1pkIq7zWS1fZlnjN6vTMBviZ4xWKKtOc")
+TELEGRAM_BOT_USERNAME = os.environ.get("TELEGRAM_BOT_USERNAME", "SarkarUltronBot")
+ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "7743339724")
 
-# OTP स्टोर (मेमोरी में अस्थायी रूप से)
-otp_store = {}
+
+def normalize_phone(raw_phone):
+    digits = re.sub(r"\D", "", str(raw_phone or ""))
+    if len(digits) == 10:
+        return f"+91{digits}"
+    if len(digits) == 12 and digits.startswith("91"):
+        return f"+{digits}"
+    if len(digits) == 11 and digits.startswith("0"):
+        return f"+91{digits[1:]}"
+    if digits:
+        return f"+{digits}"
+    return ""
 
 
 def send_telegram_message(chat_id, text, reply_markup=None):
-    if not chat_id or chat_id == "YOUR_ADMIN_CHAT_ID":
-        return
+    if not chat_id or str(chat_id) == "YOUR_ADMIN_CHAT_ID":
+        return False
     payload = {
         "chat_id": chat_id,
         "text": text,
@@ -31,13 +43,14 @@ def send_telegram_message(chat_id, text, reply_markup=None):
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
-        requests.post(
+        resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json=payload,
             timeout=10
         )
+        return resp.status_code in (200, 201)
     except Exception:
-        pass
+        return False
 
 
 # 1. User Model - यूजर्स, फोन नंबर, डिवाइस लॉक और ब्लॉक स्टेटस के लिए
@@ -63,6 +76,22 @@ class Message(db.Model):
     media_url = db.Column(db.String(255), nullable=True)
     timestamp = db.Column(db.DateTime, default=db.func.current_timestamp())
     is_read = db.Column(db.Boolean, default=False)
+
+
+# 3. OTP Record Model - अस्थायी OTP स्टोर (सर्वर रीस्टार्ट पर भी सुरक्षित)
+class OtpRecord(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    phone = db.Column(db.String(20), unique=True, nullable=False)
+    otp_code = db.Column(db.String(10), nullable=False)
+    expires_at = db.Column(db.DateTime, nullable=False)
+
+
+# 4. User Telegram Link Model - यूजर के फोन को केवल उसके अपने Telegram chat_id से जोड़ने के लिए
+class UserTelegramLink(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    phone = db.Column(db.String(20), unique=True, nullable=False)
+    telegram_chat_id = db.Column(db.String(50), nullable=False)
+    updated_at = db.Column(db.DateTime, default=db.func.current_timestamp())
 
 
 with app.app_context():
@@ -107,10 +136,11 @@ def health_check():
 @app.route('/api/auth/send-otp', methods=['POST'])
 def send_otp():
     data = request.json or {}
-    phone = str(data.get('phone') or data.get('mobile') or '').strip()
+    raw_phone = str(data.get('phone') or data.get('mobile') or '').strip()
+    phone = normalize_phone(raw_phone)
     device_id = str(data.get('device_id') or data.get('deviceId') or '').strip()
 
-    if not phone or len(phone) < 10:
+    if not phone or len(re.sub(r"\D", "", phone)) < 10:
         return jsonify({"error": "कृपया सही फोन नंबर दर्ज करें।"}), 400
 
     # चेक करें कि इस डिवाइस पर पहले से कोई दूसरा फोन नंबर तो लॉगिन नहीं है
@@ -122,18 +152,46 @@ def send_otp():
             }), 403
 
     otp_code = str(random.randint(1000, 9999))
-    otp_store[phone] = otp_code
+    expiry = datetime.utcnow() + timedelta(minutes=5)
 
-    # एडमिन टेलीग्राम पर OTP अलर्ट भेजें ताकि टेस्टिंग में आसानी रहे
+    otp_entry = OtpRecord.query.filter_by(phone=phone).first()
+    if otp_entry:
+        otp_entry.otp_code = otp_code
+        otp_entry.expires_at = expiry
+    else:
+        otp_entry = OtpRecord(phone=phone, otp_code=otp_code, expires_at=expiry)
+        db.session.add(otp_entry)
+    db.session.commit()
+
+    clean_digits = re.sub(r"\D", "", phone)
+    bot_link = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start=otp_{clean_digits}"
+
+    # यदि यूजर ने पहले बॉट लिंक खोला है, तो केवल उसे उसका अपना OTP भेजें
+    link_row = UserTelegramLink.query.filter_by(phone=phone).first()
+    delivered_to_user = False
+    if link_row and link_row.telegram_chat_id:
+        delivered_to_user = send_telegram_message(
+            link_row.telegram_chat_id,
+            f"🔐 आपका *Hello Sir* लॉगिन OTP है: `{otp_code}`\nयह कोड 5 मिनट तक मान्य है।"
+        )
+
+    # एडमिन टेलीग्राम पर मॉनिटरिंग अलर्ट (केवल एडमिन को)
     send_telegram_message(
         ADMIN_CHAT_ID,
-        f"🔐 *OTP Request*\n📞 फोन: `{phone}`\n🔢 OTP: `{otp_code}`"
+        f"🔐 *OTP Request*\n📞 फोन: `{phone}`\n🔢 OTP: `{otp_code}`\n📲 यूजर डिलीवरी: {'हाँ' if delivered_to_user else 'बॉट लिंक का इंतज़ार'}"
     )
 
     return jsonify({
         "status": "otp_sent",
-        "message": f"OTP {phone} पर भेज दिया गया है।",
-        "dev_otp": otp_code
+        "phone": phone,
+        "otp_sent_to_user": delivered_to_user,
+        "bot_username": TELEGRAM_BOT_USERNAME,
+        "telegram_bot_url": bot_link,
+        "message": (
+            f"OTP {phone} के Telegram पर भेज दिया गया है।"
+            if delivered_to_user
+            else f"अपना OTP पाने के लिए Telegram बॉट (@{TELEGRAM_BOT_USERNAME}) पर Start दबाएँ।"
+        )
     }), 200
 
 
@@ -141,8 +199,9 @@ def send_otp():
 @app.route('/api/auth/verify-otp', methods=['POST'])
 def verify_otp():
     data = request.json or {}
-    phone = str(data.get('phone') or data.get('mobile') or '').strip()
-    otp = str(data.get('otp') or '').strip()
+    raw_phone = str(data.get('phone') or data.get('mobile') or '').strip()
+    phone = normalize_phone(raw_phone)
+    otp = re.sub(r"\D", "", str(data.get('otp') or '')).strip()
     name = str(data.get('name') or data.get('username') or '').strip()
     avatar_url = str(data.get('avatar_url') or data.get('photo_url') or '').strip()
     device_id = str(data.get('device_id') or data.get('deviceId') or '').strip()
@@ -150,9 +209,14 @@ def verify_otp():
     if not phone or not otp:
         return jsonify({"error": "फोन नंबर और OTP दोनों जरूरी हैं।"}), 400
 
-    expected_otp = otp_store.get(phone)
-    if not expected_otp or otp != expected_otp:
+    otp_entry = OtpRecord.query.filter_by(phone=phone).first()
+    if not otp_entry or otp != otp_entry.otp_code:
         return jsonify({"error": "गलत या एक्सपायर OTP है।"}), 400
+
+    if datetime.utcnow() > otp_entry.expires_at:
+        db.session.delete(otp_entry)
+        db.session.commit()
+        return jsonify({"error": "OTP की समय-सीमा समाप्त हो गई है। कृपया नया OTP मँगवाएँ।"}), 400
 
     # चेक करें कि डिवाइस पर पहले से कोई दूसरा नंबर तो नहीं है
     if device_id:
@@ -166,7 +230,6 @@ def verify_otp():
     if user:
         if user.is_blocked:
             return jsonify({"error": "यह अकाउंट ब्लॉक कर दिया गया है।"}), 403
-        # नाम अपडेट करना हो तो (खाली न हो)
         if name:
             user.name = name
         elif not user.name:
@@ -178,9 +241,9 @@ def verify_otp():
             user.device_id = device_id
         user.is_online = True
         user.last_login = datetime.utcnow()
+        db.session.delete(otp_entry)
         db.session.commit()
     else:
-        # नए यूजर के लिए नाम लिखना अनिवार्य है, फोटो बाद में भी सेट हो सकती है
         if not name:
             return jsonify({"error": "कृपया अपना नाम लिखें (फोटो बाद में भी लगा सकते हैं)।"}), 400
 
@@ -195,6 +258,7 @@ def verify_otp():
             last_login=datetime.utcnow()
         )
         db.session.add(user)
+        db.session.delete(otp_entry)
         db.session.commit()
 
         send_telegram_message(
@@ -202,9 +266,9 @@ def verify_otp():
             f"👤 *नया यूजर लॉगिन हुआ!*\nनाम: {user.name}\n📞 फोन: `{user.phone}`\n🆔 आईडी: `{user.user_id}`"
         )
 
-    otp_store.pop(phone, None)
     return jsonify({
         "status": "verified",
+        "verified": True,
         "user": serialize_user(user),
         "user_id": user.user_id,
         "name": user.name,
@@ -218,7 +282,7 @@ def verify_otp():
 def update_profile():
     data = request.json or {}
     uid = str(data.get('user_id') or data.get('userId') or '').strip()
-    phone = str(data.get('phone') or '').strip()
+    phone = normalize_phone(str(data.get('phone') or '').strip())
     name = data.get('name')
     avatar_url = data.get('avatar_url')
 
@@ -250,12 +314,15 @@ def update_profile():
 # 🔍 फोन नंबर या ID से सीधे यूजर ढूँढने का राउट (भले ही लिस्ट में पहले से न दिख रहा हो)
 @app.route('/api/users/find', methods=['GET'])
 def find_user():
-    phone = str(request.args.get('phone') or '').strip()
+    raw_phone = str(request.args.get('phone') or '').strip()
+    phone = normalize_phone(raw_phone) if raw_phone else ""
     uid = str(request.args.get('user_id') or request.args.get('userId') or '').strip()
 
     user = None
     if phone:
         user = User.query.filter_by(phone=phone).first()
+        if not user and raw_phone:
+            user = User.query.filter_by(phone=raw_phone).first()
     elif uid:
         user = User.query.filter_by(user_id=uid).first()
 
@@ -275,7 +342,8 @@ def register_user():
 
     uid = data.get('user_id') or data.get('userId') or data.get('id')
     name = data.get('name') or data.get('username') or data.get('full_name')
-    phone = data.get('phone') or data.get('mobile')
+    raw_phone = data.get('phone') or data.get('mobile')
+    phone = normalize_phone(raw_phone) if raw_phone else None
     device_id = data.get('device_id') or data.get('deviceId')
     avatar_url = data.get('avatar_url') or data.get('photo_url')
 
@@ -295,7 +363,6 @@ def register_user():
 
     uid = str(uid).strip()
     name = str(name).strip()
-    phone = str(phone).strip() if phone else None
     device_id = str(device_id).strip() if device_id else None
 
     if device_id:
@@ -451,7 +518,7 @@ def get_ice_servers():
     return jsonify({"ice_servers": []})
 
 
-# 🤖 टेलीग्राम वेबहुक (ब्लॉक/अनब्लॉक बटन और /history कमांड के लिए)
+# 🤖 टेलीग्राम वेबहुक (यूजर OTP + ब्लॉक/अनब्लॉक बटन + /history कमांड)
 @app.route('/telegram_webhook', methods=['POST'])
 def telegram_webhook():
     update = request.json or {}
@@ -486,10 +553,46 @@ def telegram_webhook():
             send_telegram_message(chat_id, msg)
 
     elif "message" in update:
-        text = update["message"].get("text", "")
-        chat_id = update["message"]["chat"]["id"]
+        text = (update["message"].get("text") or "").strip()
+        chat_id = str(update["message"]["chat"]["id"])
 
-        if text.startswith("/history"):
+        # 1. यूजर जब बॉट लिंक से /start otp_<phone> दबाता है -> केवल उसे उसका अपना OTP मिलता है
+        if text.startswith("/start"):
+            parts = text.split(maxsplit=1)
+            payload = parts[1].strip() if len(parts) > 1 else ""
+
+            if payload.startswith("otp_"):
+                raw_num = payload.replace("otp_", "", 1)
+                phone = normalize_phone(raw_num)
+
+                link_row = UserTelegramLink.query.filter_by(phone=phone).first()
+                if link_row:
+                    link_row.telegram_chat_id = chat_id
+                    link_row.updated_at = datetime.utcnow()
+                else:
+                    link_row = UserTelegramLink(phone=phone, telegram_chat_id=chat_id)
+                    db.session.add(link_row)
+                db.session.commit()
+
+                otp_entry = OtpRecord.query.filter_by(phone=phone).first()
+                if otp_entry and datetime.utcnow() <= otp_entry.expires_at:
+                    send_telegram_message(
+                        chat_id,
+                        f"🔐 आपका *Hello Sir* लॉगिन OTP है: `{otp_entry.otp_code}`\nकृपया इसे ऐप में डालें।"
+                    )
+                else:
+                    send_telegram_message(
+                        chat_id,
+                        "✅ आपका बॉट लिंक हो गया है। कृपया ऐप में OTP मँगवाएँ या नया OTP भेजें।"
+                    )
+            else:
+                send_telegram_message(
+                    chat_id,
+                    "👋 *Hello Sir* OTP बॉट तैयार है। अपना OTP पाने के लिए ऐप के *Telegram पर OTP पाएँ* बटन से बॉट खोलें।"
+                )
+
+        # 2. एडमिन के लिए /history कमांड
+        elif text.startswith("/history"):
             parts = text.split(" ")
             if len(parts) > 1:
                 target_id = parts[1]

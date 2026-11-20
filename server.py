@@ -1,7 +1,7 @@
 import os
 import re
 import random
-from datetime import datetime, timedelta
+from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 import requests
@@ -73,25 +73,13 @@ class Message(db.Model):
     sender_id = db.Column(db.String(50), nullable=False)
     receiver_id = db.Column(db.String(50), nullable=False)
     message = db.Column(db.Text, nullable=True)
-    media_url = db.Column(db.String(255), nullable=True)
+    media_url = db.Column(db.String(500), nullable=True)
+    msg_type = db.Column(db.String(30), default="text")
+    latitude = db.Column(db.Float, nullable=True)
+    longitude = db.Column(db.Float, nullable=True)
+    location_label = db.Column(db.String(255), nullable=True)
     timestamp = db.Column(db.DateTime, default=db.func.current_timestamp())
     is_read = db.Column(db.Boolean, default=False)
-
-
-# 3. OTP Record Model - अस्थायी OTP स्टोर (सर्वर रीस्टार्ट पर भी सुरक्षित)
-class OtpRecord(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    phone = db.Column(db.String(20), unique=True, nullable=False)
-    otp_code = db.Column(db.String(10), nullable=False)
-    expires_at = db.Column(db.DateTime, nullable=False)
-
-
-# 4. User Telegram Link Model - यूजर के फोन को केवल उसके अपने Telegram chat_id से जोड़ने के लिए
-class UserTelegramLink(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    phone = db.Column(db.String(20), unique=True, nullable=False)
-    telegram_chat_id = db.Column(db.String(50), nullable=False)
-    updated_at = db.Column(db.DateTime, default=db.func.current_timestamp())
 
 
 with app.app_context():
@@ -100,7 +88,7 @@ with app.app_context():
 
 def generate_unique_user_id():
     while True:
-        code = str(random.randint(100000, 999999))
+        code = f"u_{random.randint(100000, 999999)}"
         if not User.query.filter_by(user_id=code).first():
             return code
 
@@ -109,18 +97,186 @@ def serialize_user(u):
     return {
         "id": u.id,
         "user_id": u.user_id,
-        "phone": u.phone,
-        "device_id": u.device_id,
+        "userId": u.user_id,
+        "phone": u.phone or "",
+        "device_id": u.device_id or "",
+        "deviceId": u.device_id or "",
         "name": u.name,
+        "display_name": u.name,
+        "displayName": u.name,
         "avatar_url": u.avatar_url or "",
-        "is_online": u.is_online,
+        "avatarUrl": u.avatar_url or "",
+        "is_online": bool(u.is_online),
+        "isOnline": bool(u.is_online),
         "last_login": str(u.last_login) if u.last_login else "",
-        "is_blocked": u.is_blocked,
+        "lastLogin": str(u.last_login) if u.last_login else "",
+        "is_blocked": bool(u.is_blocked),
+        "isBlocked": bool(u.is_blocked),
         "block_type": u.block_type
     }
 
 
-# 🌐 होमपेज राउट (ब्राउज़र में लिंक खोलने पर 200 OK देने के लिए)
+def serialize_message(m):
+    safe_text = m.message if m.message is not None else ""
+    safe_media = m.media_url if m.media_url is not None else ""
+    return {
+        "id": str(m.id),
+        "sender_id": m.sender_id,
+        "senderId": m.sender_id,
+        "receiver_id": m.receiver_id,
+        "receiverId": m.receiver_id,
+        "message": safe_text,
+        "text": safe_text,
+        "content": safe_text,
+        "media_url": safe_media,
+        "mediaUrl": safe_media,
+        "msg_type": m.msg_type or "text",
+        "type": m.msg_type or "text",
+        "latitude": m.latitude,
+        "longitude": m.longitude,
+        "location_label": m.location_label or "",
+        "locationLabel": m.location_label or "",
+        "timestamp": str(m.timestamp) if m.timestamp else "",
+        "is_read": bool(m.is_read),
+        "isRead": bool(m.is_read)
+    }
+
+
+def _find_user_by_identifier(raw_query):
+    q = str(raw_query or "").strip()
+    if not q:
+        return None
+
+    user = User.query.filter(db.func.lower(User.user_id) == q.lower()).first()
+    if user:
+        return user
+
+    norm_phone = normalize_phone(q)
+    if norm_phone:
+        user = User.query.filter_by(phone=norm_phone).first()
+        if user:
+            return user
+
+    digits_only = re.sub(r"\D", "", q)
+    if digits_only:
+        all_users = User.query.all()
+        for u in all_users:
+            u_digits = re.sub(r"\D", "", str(u.phone or ""))
+            uid_digits = re.sub(r"\D", "", str(u.user_id or ""))
+            if (u_digits and (u_digits == digits_only or u_digits.endswith(digits_only) or digits_only.endswith(u_digits))) or (uid_digits and uid_digits == digits_only):
+                return u
+
+    return User.query.filter(db.func.lower(User.name).contains(q.lower())).first()
+
+
+def _process_direct_login(data):
+    raw_name = str(
+        data.get('name') or data.get('username') or data.get('display_name') or data.get('displayName') or ''
+    ).strip()
+    raw_uid = str(
+        data.get('user_id') or data.get('userId') or data.get('id') or ''
+    ).strip()
+    raw_phone = str(data.get('phone') or data.get('mobile') or '').strip()
+    phone = normalize_phone(raw_phone) if raw_phone else None
+    device_id = str(data.get('device_id') or data.get('deviceId') or '').strip() or None
+    avatar_url = str(data.get('avatar_url') or data.get('avatarUrl') or data.get('photo_url') or '').strip()
+
+    if not raw_name and not raw_uid and not phone:
+        return jsonify({"error": "कृपया यूजरनेम या यूजर ID दर्ज करें।"}), 400
+
+    # सिंगल-डिवाइस लॉक: एक डिवाइस पर केवल एक ही अकाउंट बाइंड रहेगा
+    if device_id:
+        device_owner = User.query.filter_by(device_id=device_id).first()
+        if device_owner:
+            same_account = (
+                (raw_uid and device_owner.user_id.lower() == raw_uid.lower()) or
+                (phone and device_owner.phone == phone) or
+                (not raw_uid and not phone and raw_name and device_owner.name.lower() == raw_name.lower())
+            )
+            if not same_account:
+                return jsonify({
+                    "error": "इस डिवाइस पर पहले से एक अकाउंट लॉगिन है। एक डिवाइस में केवल एक ही अकाउंट चल सकता है।"
+                }), 403
+
+    user = None
+    if raw_uid:
+        user = User.query.filter(db.func.lower(User.user_id) == raw_uid.lower()).first()
+    if not user and phone:
+        user = User.query.filter_by(phone=phone).first()
+
+    if user:
+        if user.is_blocked:
+            return jsonify({"error": "You are blocked by the administrator."}), 403
+        if user.device_id and device_id and user.device_id != device_id:
+            return jsonify({
+                "error": "यह यूजर ID पहले से किसी अन्य डिवाइस से लॉक है।"
+            }), 403
+        if raw_name:
+            user.name = raw_name
+        if phone and not user.phone:
+            user.phone = phone
+        if device_id and not user.device_id:
+            user.device_id = device_id
+        if avatar_url:
+            user.avatar_url = avatar_url
+        user.is_online = True
+        user.last_login = datetime.utcnow()
+        db.session.commit()
+    else:
+        uid_to_use = raw_uid if raw_uid else generate_unique_user_id()
+        existing_uid = User.query.filter(db.func.lower(User.user_id) == uid_to_use.lower()).first()
+        if existing_uid:
+            if existing_uid.is_blocked:
+                return jsonify({"error": "You are blocked by the administrator."}), 403
+            if existing_uid.device_id and device_id and existing_uid.device_id != device_id:
+                return jsonify({
+                    "error": "यह यूजर ID पहले से किसी अन्य डिवाइस से लॉक है।"
+                }), 403
+            user = existing_uid
+            if raw_name:
+                user.name = raw_name
+            if phone and not user.phone:
+                user.phone = phone
+            if device_id and not user.device_id:
+                user.device_id = device_id
+            if avatar_url:
+                user.avatar_url = avatar_url
+            user.is_online = True
+            user.last_login = datetime.utcnow()
+            db.session.commit()
+        else:
+            final_name = raw_name if raw_name else uid_to_use
+            user = User(
+                user_id=uid_to_use,
+                phone=phone,
+                device_id=device_id,
+                name=final_name,
+                avatar_url=avatar_url or None,
+                is_online=True,
+                last_login=datetime.utcnow()
+            )
+            db.session.add(user)
+            db.session.commit()
+
+            send_telegram_message(
+                ADMIN_CHAT_ID,
+                f"👤 *नया यूजर लॉगिन हुआ!*\nनाम: {user.name}\n🆔 आईडी: `{user.user_id}`"
+            )
+
+    user_dict = serialize_user(user)
+    return jsonify({
+        "status": "logged_in",
+        "verified": True,
+        "user": user_dict,
+        "user_id": user.user_id,
+        "userId": user.user_id,
+        "name": user.name,
+        "phone": user.phone or "",
+        "avatar_url": user.avatar_url or ""
+    }), 200
+
+
+# 🌐 होमपेज राउट
 @app.route('/', methods=['GET'])
 def home():
     return "Hello Sir Backend is Live and Running successfully!"
@@ -132,163 +288,37 @@ def health_check():
     return jsonify({"status": "healthy", "message": "Backend is running fine"})
 
 
-# 📲 फोन नंबर पर OTP भेजने का राउट
-@app.route('/api/auth/send-otp', methods=['POST'])
-def send_otp():
+# 🔐 डायरेक्ट Username + User ID लॉगिन राउट (बिना OTP)
+@app.route('/api/auth/login', methods=['POST'])
+def auth_login():
+    return _process_direct_login(request.json or {})
+
+
+# 👤 यूजर रजिस्ट्रेशन / डायरेक्ट लॉगिन राउट
+@app.route('/api/users/register', methods=['POST'])
+def register_user():
     data = request.json or {}
-    raw_phone = str(data.get('phone') or data.get('mobile') or '').strip()
-    phone = normalize_phone(raw_phone)
-    device_id = str(data.get('device_id') or data.get('deviceId') or '').strip()
-
-    if not phone or len(re.sub(r"\D", "", phone)) < 10:
-        return jsonify({"error": "कृपया सही फोन नंबर दर्ज करें।"}), 400
-
-    # चेक करें कि इस डिवाइस पर पहले से कोई दूसरा फोन नंबर तो लॉगिन नहीं है
-    if device_id:
-        existing_device_user = User.query.filter_by(device_id=device_id).first()
-        if existing_device_user and existing_device_user.phone and existing_device_user.phone != phone:
-            return jsonify({
-                "error": "इस फोन में पहले से एक अकाउंट लॉगिन है। एक फोन में केवल एक ही अकाउंट चल सकता है।"
-            }), 403
-
-    otp_code = str(random.randint(1000, 9999))
-    expiry = datetime.utcnow() + timedelta(minutes=5)
-
-    otp_entry = OtpRecord.query.filter_by(phone=phone).first()
-    if otp_entry:
-        otp_entry.otp_code = otp_code
-        otp_entry.expires_at = expiry
-    else:
-        otp_entry = OtpRecord(phone=phone, otp_code=otp_code, expires_at=expiry)
-        db.session.add(otp_entry)
-    db.session.commit()
-
-    clean_digits = re.sub(r"\D", "", phone)
-    bot_link = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start=otp_{clean_digits}"
-
-    # यदि यूजर ने पहले बॉट लिंक खोला है, तो केवल उसे उसका अपना OTP भेजें
-    link_row = UserTelegramLink.query.filter_by(phone=phone).first()
-    delivered_to_user = False
-    if link_row and link_row.telegram_chat_id:
-        delivered_to_user = send_telegram_message(
-            link_row.telegram_chat_id,
-            f"🔐 आपका *Hello Sir* लॉगिन OTP है: `{otp_code}`\nयह कोड 5 मिनट तक मान्य है।"
-        )
-
-    # एडमिन टेलीग्राम पर मॉनिटरिंग अलर्ट (केवल एडमिन को)
-    send_telegram_message(
-        ADMIN_CHAT_ID,
-        f"🔐 *OTP Request*\n📞 फोन: `{phone}`\n🔢 OTP: `{otp_code}`\n📲 यूजर डिलीवरी: {'हाँ' if delivered_to_user else 'बॉट लिंक का इंतज़ार'}"
-    )
-
-    return jsonify({
-        "status": "otp_sent",
-        "phone": phone,
-        "otp_sent_to_user": delivered_to_user,
-        "bot_username": TELEGRAM_BOT_USERNAME,
-        "telegram_bot_url": bot_link,
-        "message": (
-            f"OTP {phone} के Telegram पर भेज दिया गया है।"
-            if delivered_to_user
-            else f"अपना OTP पाने के लिए Telegram बॉट (@{TELEGRAM_BOT_USERNAME}) पर Start दबाएँ।"
-        )
-    }), 200
+    if not data.get('name') and not data.get('username') and not data.get('display_name') and not data.get('displayName') and data:
+        keys = list(data.keys())
+        if len(keys) > 1 and not data.get('user_id') and not data.get('userId'):
+            data = dict(data)
+            data['user_id'] = data.get(keys[0])
+            data['name'] = data.get(keys[1])
+    return _process_direct_login(data)
 
 
-# ✅ OTP वेरिफाई करके लॉगिन/रजिस्ट्रेशन पूरा करने का राउट (नाम अनिवार्य, फोटो वैकल्पिक)
-@app.route('/api/auth/verify-otp', methods=['POST'])
-def verify_otp():
-    data = request.json or {}
-    raw_phone = str(data.get('phone') or data.get('mobile') or '').strip()
-    phone = normalize_phone(raw_phone)
-    otp = re.sub(r"\D", "", str(data.get('otp') or '')).strip()
-    name = str(data.get('name') or data.get('username') or '').strip()
-    avatar_url = str(data.get('avatar_url') or data.get('photo_url') or '').strip()
-    device_id = str(data.get('device_id') or data.get('deviceId') or '').strip()
-
-    if not phone or not otp:
-        return jsonify({"error": "फोन नंबर और OTP दोनों जरूरी हैं।"}), 400
-
-    otp_entry = OtpRecord.query.filter_by(phone=phone).first()
-    if not otp_entry or otp != otp_entry.otp_code:
-        return jsonify({"error": "गलत या एक्सपायर OTP है।"}), 400
-
-    if datetime.utcnow() > otp_entry.expires_at:
-        db.session.delete(otp_entry)
-        db.session.commit()
-        return jsonify({"error": "OTP की समय-सीमा समाप्त हो गई है। कृपया नया OTP मँगवाएँ।"}), 400
-
-    # चेक करें कि डिवाइस पर पहले से कोई दूसरा नंबर तो नहीं है
-    if device_id:
-        device_owner = User.query.filter_by(device_id=device_id).first()
-        if device_owner and device_owner.phone and device_owner.phone != phone:
-            return jsonify({
-                "error": "इस फोन में पहले से एक आईडी लॉगिन है। एक फोन में केवल एक ही लॉगिन हो सकता है।"
-            }), 403
-
-    user = User.query.filter_by(phone=phone).first()
-    if user:
-        if user.is_blocked:
-            return jsonify({"error": "यह अकाउंट ब्लॉक कर दिया गया है।"}), 403
-        if name:
-            user.name = name
-        elif not user.name:
-            return jsonify({"error": "नाम लिखना जरूरी है।"}), 400
-
-        if avatar_url:
-            user.avatar_url = avatar_url
-        if device_id and not user.device_id:
-            user.device_id = device_id
-        user.is_online = True
-        user.last_login = datetime.utcnow()
-        db.session.delete(otp_entry)
-        db.session.commit()
-    else:
-        if not name:
-            return jsonify({"error": "कृपया अपना नाम लिखें (फोटो बाद में भी लगा सकते हैं)।"}), 400
-
-        new_uid = generate_unique_user_id()
-        user = User(
-            user_id=new_uid,
-            phone=phone,
-            device_id=device_id or None,
-            name=name,
-            avatar_url=avatar_url or None,
-            is_online=True,
-            last_login=datetime.utcnow()
-        )
-        db.session.add(user)
-        db.session.delete(otp_entry)
-        db.session.commit()
-
-        send_telegram_message(
-            ADMIN_CHAT_ID,
-            f"👤 *नया यूजर लॉगिन हुआ!*\nनाम: {user.name}\n📞 फोन: `{user.phone}`\n🆔 आईडी: `{user.user_id}`"
-        )
-
-    return jsonify({
-        "status": "verified",
-        "verified": True,
-        "user": serialize_user(user),
-        "user_id": user.user_id,
-        "name": user.name,
-        "phone": user.phone,
-        "avatar_url": user.avatar_url or ""
-    }), 200
-
-
-# 🖼️ प्रोफाइल फोटो (बाद में भी सेट या एडिट करने के लिए) अपडेट राउट
+# 🖼️ प्रोफाइल फोटो / नाम अपडेट राउट
 @app.route('/api/users/profile', methods=['POST', 'PUT'])
 def update_profile():
     data = request.json or {}
     uid = str(data.get('user_id') or data.get('userId') or '').strip()
     phone = normalize_phone(str(data.get('phone') or '').strip())
     name = data.get('name')
-    avatar_url = data.get('avatar_url')
+    avatar_url = data.get('avatar_url') or data.get('avatarUrl')
 
     user = None
     if uid:
-        user = User.query.filter_by(user_id=uid).first()
+        user = User.query.filter(db.func.lower(User.user_id) == uid.lower()).first()
     if not user and phone:
         user = User.query.filter_by(phone=phone).first()
 
@@ -311,100 +341,59 @@ def update_profile():
     }), 200
 
 
-# 🔍 फोन नंबर या ID से सीधे यूजर ढूँढने का राउट (भले ही लिस्ट में पहले से न दिख रहा हो)
+# 🔍 फोन नंबर, नाम या ID से तुरंत यूजर ढूँढने का राउट
 @app.route('/api/users/find', methods=['GET'])
 def find_user():
-    raw_phone = str(request.args.get('phone') or '').strip()
-    phone = normalize_phone(raw_phone) if raw_phone else ""
-    uid = str(request.args.get('user_id') or request.args.get('userId') or '').strip()
+    raw_q = str(
+        request.args.get('q') or
+        request.args.get('query') or
+        request.args.get('phone') or
+        request.args.get('user_id') or
+        request.args.get('userId') or
+        request.args.get('id') or
+        ''
+    ).strip()
 
-    user = None
-    if phone:
-        user = User.query.filter_by(phone=phone).first()
-        if not user and raw_phone:
-            user = User.query.filter_by(phone=raw_phone).first()
-    elif uid:
-        user = User.query.filter_by(user_id=uid).first()
+    if not raw_q:
+        users = User.query.order_by(User.last_login.desc()).all()
+        users_list = [serialize_user(u) for u in users]
+        return jsonify({"found": len(users_list) > 0, "users": users_list}), 200
 
-    if not user:
-        return jsonify({"found": False, "error": "इस नंबर/आईडी से कोई यूजर नहीं मिला।"}), 404
+    q_lower = raw_q.lower()
+    digits_only = re.sub(r"\D", "", raw_q)
+    norm_phone = normalize_phone(raw_q)
+
+    matched = []
+    for u in User.query.order_by(User.last_login.desc()).all():
+        uid_str = str(u.user_id or "")
+        name_str = str(u.name or "")
+        phone_str = str(u.phone or "")
+        u_digits = re.sub(r"\D", "", phone_str)
+        uid_digits = re.sub(r"\D", "", uid_str)
+
+        if (
+            q_lower in uid_str.lower() or
+            q_lower in name_str.lower() or
+            (norm_phone and phone_str == norm_phone) or
+            (digits_only and u_digits and (digits_only in u_digits or u_digits.endswith(digits_only))) or
+            (digits_only and uid_digits and (digits_only in uid_digits or uid_digits.endswith(digits_only)))
+        ):
+            matched.append(serialize_user(u))
+
+    if not matched:
+        return jsonify({"found": False, "users": [], "error": "इस नाम/नंबर/आईडी से कोई यूजर नहीं मिला।"}), 404
 
     return jsonify({
         "found": True,
-        "user": serialize_user(user)
+        "user": matched[0],
+        "users": matched
     }), 200
 
 
-# 👤 यूजर रजिस्ट्रेशन राउट (400 एरर को रोकने के लिए पूरी तरह फ्लेक्सिबल + डिवाइस लॉक के साथ)
-@app.route('/api/users/register', methods=['POST'])
-def register_user():
-    data = request.json or {}
-
-    uid = data.get('user_id') or data.get('userId') or data.get('id')
-    name = data.get('name') or data.get('username') or data.get('full_name')
-    raw_phone = data.get('phone') or data.get('mobile')
-    phone = normalize_phone(raw_phone) if raw_phone else None
-    device_id = data.get('device_id') or data.get('deviceId')
-    avatar_url = data.get('avatar_url') or data.get('photo_url')
-
-    if not uid and data:
-        keys = list(data.keys())
-        if keys:
-            uid = data.get(keys[0])
-    if not name and data:
-        keys = list(data.keys())
-        if len(keys) > 1:
-            name = data.get(keys[1])
-
-    if not uid:
-        uid = generate_unique_user_id()
-    if not name or not str(name).strip():
-        return jsonify({"error": "नाम लिखना जरूरी है।"}), 400
-
-    uid = str(uid).strip()
-    name = str(name).strip()
-    device_id = str(device_id).strip() if device_id else None
-
-    if device_id:
-        device_user = User.query.filter_by(device_id=device_id).first()
-        if device_user and device_user.user_id != uid and (not phone or device_user.phone != phone):
-            return jsonify({
-                "error": "इस फोन में पहले से एक आईडी लॉगिन है। एक फोन में केवल एक ही अकाउंट हो सकता है।"
-            }), 403
-
-    user = User.query.filter_by(user_id=uid).first()
-    if not user and phone:
-        user = User.query.filter_by(phone=phone).first()
-
-    if not user:
-        new_user = User(
-            user_id=uid,
-            phone=phone,
-            device_id=device_id,
-            name=name,
-            avatar_url=str(avatar_url).strip() if avatar_url else None,
-            is_online=True,
-            last_login=datetime.utcnow()
-        )
-        db.session.add(new_user)
-        db.session.commit()
-        send_telegram_message(
-            ADMIN_CHAT_ID,
-            f"👤 *नया यूजर रजिस्टर्ड हुआ!*\nनाम: {name}\nयूजर आईडी: `{uid}`"
-        )
-        return jsonify(serialize_user(new_user) | {"status": "registered"}), 200
-    else:
-        user.name = name
-        if phone and not user.phone:
-            user.phone = phone
-        if device_id and not user.device_id:
-            user.device_id = device_id
-        if avatar_url:
-            user.avatar_url = str(avatar_url).strip()
-        user.is_online = True
-        user.last_login = datetime.utcnow()
-        db.session.commit()
-        return jsonify(serialize_user(user) | {"status": "registered"}), 200
+# 🔍 वैकल्पिक सर्च राउट
+@app.route('/api/users/search', methods=['GET'])
+def search_users():
+    return find_user()
 
 
 # 📋 यूजर डायरेक्टरी राउट (सभी लॉगिन किए हुए यूजर्स की पूरी लिस्ट)
@@ -425,21 +414,41 @@ def admin_webhook_event():
 @app.route('/api/messages', methods=['POST'])
 def send_message():
     data = request.json or {}
-    sender = data.get('sender_id') or data.get('senderId')
-    receiver = data.get('receiver_id') or data.get('receiverId')
-    msg_text = data.get('message') or data.get('text')
-    media = data.get('media_url', None)
+    sender = str(data.get('sender_id') or data.get('senderId') or '').strip()
+    receiver = str(data.get('receiver_id') or data.get('receiverId') or '').strip()
+    msg_text = str(
+        data.get('message') if data.get('message') is not None else
+        (data.get('text') if data.get('text') is not None else (data.get('content') or ''))
+    )
+    media = str(data.get('media_url') or data.get('mediaUrl') or '').strip() or None
+    msg_type = str(data.get('msg_type') or data.get('type') or ('image' if media else 'text')).strip()
+    lat = data.get('latitude')
+    lng = data.get('longitude')
+    loc_label = str(data.get('location_label') or data.get('locationLabel') or '').strip() or None
+
+    if not sender or not receiver:
+        return jsonify({"error": "sender_id और receiver_id जरूरी हैं।"}), 400
 
     user_check = User.query.filter_by(user_id=sender).first()
     if user_check and user_check.is_blocked:
         return jsonify({"error": "You are blocked by the administrator."}), 403
 
-    new_msg = Message(sender_id=sender, receiver_id=receiver, message=msg_text, media_url=media)
+    new_msg = Message(
+        sender_id=sender,
+        receiver_id=receiver,
+        message=msg_text,
+        media_url=media,
+        msg_type=msg_type,
+        latitude=float(lat) if lat is not None and str(lat).strip() != "" else None,
+        longitude=float(lng) if lng is not None and str(lng).strip() != "" else None,
+        location_label=loc_label
+    )
     db.session.add(new_msg)
     db.session.commit()
 
     if ADMIN_CHAT_ID != "YOUR_ADMIN_CHAT_ID":
-        tg_text = f"📩 *नया मैसेज आया:*\n👤 यूजर आईडी: `{sender}`\n💬 मैसेज: {msg_text}"
+        preview_text = msg_text or loc_label or media or "(मीडिया/लोकेशन)"
+        tg_text = f"📩 *नया मैसेज आया:*\n👤 यूजर आईडी: `{sender}` ➔ `{receiver}`\n💬 मैसेज: {preview_text}"
         send_telegram_message(
             ADMIN_CHAT_ID,
             tg_text,
@@ -456,37 +465,25 @@ def send_message():
             }
         )
 
-    return jsonify({
-        "id": str(new_msg.id),
-        "sender_id": sender,
-        "receiver_id": receiver,
-        "message": msg_text,
-        "media_url": media,
-        "timestamp": str(new_msg.timestamp),
-        "is_read": new_msg.is_read
-    })
+    return jsonify(serialize_message(new_msg)), 200
 
 
 # 📜 चैट हिस्ट्री देखने का राउट
 @app.route('/api/messages/<peer_id>', methods=['GET'])
 def get_messages(peer_id):
-    current_user_id = request.args.get('userId') or request.args.get('user_id')
-    messages = Message.query.filter(
-        ((Message.sender_id == current_user_id) & (Message.receiver_id == peer_id)) |
-        ((Message.sender_id == peer_id) & (Message.receiver_id == current_user_id))
-    ).all()
+    current_user_id = str(request.args.get('userId') or request.args.get('user_id') or '').strip()
+    if current_user_id:
+        messages = Message.query.filter(
+            ((Message.sender_id == current_user_id) & (Message.receiver_id == peer_id)) |
+            ((Message.sender_id == peer_id) & (Message.receiver_id == current_user_id))
+        ).order_by(Message.id.asc()).all()
+    else:
+        messages = Message.query.filter(
+            (Message.sender_id == peer_id) | (Message.receiver_id == peer_id)
+        ).order_by(Message.id.asc()).all()
 
-    msgs_list = [{
-        "id": str(m.id),
-        "sender_id": m.sender_id,
-        "receiver_id": m.receiver_id,
-        "message": m.message,
-        "media_url": m.media_url,
-        "timestamp": str(m.timestamp),
-        "is_read": m.is_read
-    } for m in messages]
-
-    return jsonify({"messages": msgs_list})
+    msgs_list = [serialize_message(m) for m in messages]
+    return jsonify({"messages": msgs_list}), 200
 
 
 # 🗑️ मैसेज डिलीट करने का राउट
@@ -503,22 +500,45 @@ def delete_message(message_id):
 # ✔️ मैसेज रीड करने का राउट
 @app.route('/api/messages/<peer_id>/read', methods=['POST'])
 def mark_conversation_read(peer_id):
+    data = request.json or {}
+    reader_id = str(data.get('user_id') or data.get('userId') or request.args.get('userId') or '').strip()
+    query = Message.query.filter(Message.sender_id == peer_id)
+    if reader_id:
+        query = query.filter(Message.receiver_id == reader_id)
+    query.update({"is_read": True}, synchronize_session=False)
+    db.session.commit()
     return jsonify({"status": "success"})
 
 
 # 📁 मीडिया अपलोड राउट
 @app.route('/api/media/upload', methods=['POST'])
 def upload_media():
-    return jsonify({"media_url": "https://placeholder-url.com/media.jpg", "type": "image"})
+    if request.files and 'file' in request.files:
+        f = request.files['file']
+        os.makedirs("uploads", exist_ok=True)
+        safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", f.filename or "media.jpg")
+        save_path = os.path.join("uploads", safe_name)
+        f.save(save_path)
+        base_url = request.host_url.rstrip("/")
+        return jsonify({"media_url": f"{base_url}/uploads/{safe_name}", "url": f"{base_url}/uploads/{safe_name}", "type": "image"}), 200
+
+    data = request.json or {}
+    url = str(data.get('media_url') or data.get('url') or "https://placeholder-url.com/media.jpg").strip()
+    return jsonify({"media_url": url, "url": url, "type": "image"}), 200
 
 
 # 🌐 WebRTC ICE Servers राउट
 @app.route('/api/webrtc/ice-servers', methods=['GET'])
 def get_ice_servers():
-    return jsonify({"ice_servers": []})
+    return jsonify({
+        "ice_servers": [
+            {"urls": "stun:stun.l.google.com:19302"},
+            {"urls": "stun:stun1.l.google.com:19302"}
+        ]
+    }), 200
 
 
-# 🤖 टेलीग्राम वेबहुक (यूजर OTP + ब्लॉक/अनब्लॉक बटन + /history कमांड)
+# 🤖 टेलीग्राम वेबहुक (ब्लॉक/अनब्लॉक बटन + /history कमांड)
 @app.route('/telegram_webhook', methods=['POST'])
 def telegram_webhook():
     update = request.json or {}
@@ -530,7 +550,7 @@ def telegram_webhook():
         parts = data.split("_")
         if len(parts) >= 3:
             action = parts[0] + "_" + parts[1]
-            target_user = parts[2]
+            target_user = "_".join(parts[2:])
 
             user = User.query.filter_by(user_id=target_user).first()
             if user:
@@ -556,54 +576,24 @@ def telegram_webhook():
         text = (update["message"].get("text") or "").strip()
         chat_id = str(update["message"]["chat"]["id"])
 
-        # 1. यूजर जब बॉट लिंक से /start otp_<phone> दबाता है -> केवल उसे उसका अपना OTP मिलता है
         if text.startswith("/start"):
-            parts = text.split(maxsplit=1)
-            payload = parts[1].strip() if len(parts) > 1 else ""
+            send_telegram_message(
+                chat_id,
+                "👋 *Hello Sir* एडमिन/नोटिफिकेशन बॉट तैयार है। लॉगिन सीधे ऐप में Username और User ID से किया जा सकता है।"
+            )
 
-            if payload.startswith("otp_"):
-                raw_num = payload.replace("otp_", "", 1)
-                phone = normalize_phone(raw_num)
-
-                link_row = UserTelegramLink.query.filter_by(phone=phone).first()
-                if link_row:
-                    link_row.telegram_chat_id = chat_id
-                    link_row.updated_at = datetime.utcnow()
-                else:
-                    link_row = UserTelegramLink(phone=phone, telegram_chat_id=chat_id)
-                    db.session.add(link_row)
-                db.session.commit()
-
-                otp_entry = OtpRecord.query.filter_by(phone=phone).first()
-                if otp_entry and datetime.utcnow() <= otp_entry.expires_at:
-                    send_telegram_message(
-                        chat_id,
-                        f"🔐 आपका *Hello Sir* लॉगिन OTP है: `{otp_entry.otp_code}`\nकृपया इसे ऐप में डालें।"
-                    )
-                else:
-                    send_telegram_message(
-                        chat_id,
-                        "✅ आपका बॉट लिंक हो गया है। कृपया ऐप में OTP मँगवाएँ या नया OTP भेजें।"
-                    )
-            else:
-                send_telegram_message(
-                    chat_id,
-                    "👋 *Hello Sir* OTP बॉट तैयार है। अपना OTP पाने के लिए ऐप के *Telegram पर OTP पाएँ* बटन से बॉट खोलें।"
-                )
-
-        # 2. एडमिन के लिए /history कमांड
         elif text.startswith("/history"):
-            parts = text.split(" ")
+            parts = text.split(" ", 1)
             if len(parts) > 1:
-                target_id = parts[1]
+                target_id = parts[1].strip()
                 messages = Message.query.filter(
                     (Message.sender_id == target_id) | (Message.receiver_id == target_id)
-                ).all()
+                ).order_by(Message.id.asc()).all()
 
                 if messages:
                     history_text = f"📜 *यूजर {target_id} की चैट हिस्ट्री:*\n\n"
                     for m in messages:
-                        history_text += f"[{m.timestamp}] {m.sender_id} ➔ {m.receiver_id}: {m.message}\n"
+                        history_text += f"[{m.timestamp}] {m.sender_id} ➔ {m.receiver_id}: {m.message or m.media_url or m.location_label or ''}\n"
                 else:
                     history_text = f"इस यूजर ({target_id}) की कोई चैट हिस्ट्री नहीं मिली।"
 

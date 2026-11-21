@@ -1,8 +1,9 @@
 import os
 import re
 import random
+import threading
 from datetime import datetime
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
 import requests
 
@@ -13,10 +14,19 @@ app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///chat_app.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
+# मीडिया फ़ाइल्स सेव और सर्व करने के लिए फ़ोल्डर
+UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
 # आपका आधिकारिक टेलीग्राम बॉट टोकन, बॉट यूजरनेम और आपकी चैट आईडी
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8970811998:AAG1pkIq7zWS1fZlnjN6vTMBviZ4xWKKtOc")
 TELEGRAM_BOT_USERNAME = os.environ.get("TELEGRAM_BOT_USERNAME", "SarkarUltronBot")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "7743339724")
+
+# ऑडियो/वीडियो कॉल सिग्नलिंग के लिए थ्रेड-सेफ स्टोर (रिंग, ऑफर, आंसर, ICE, हैंगअप)
+CALL_LOCK = threading.Lock()
+CALL_SIGNALS = {}   # target_user_id_lower -> list of signal dicts
+ACTIVE_CALLS = {}   # call_id -> call metadata dict
 
 
 def normalize_phone(raw_phone):
@@ -142,33 +152,6 @@ def serialize_message(m):
     }
 
 
-def _find_user_by_identifier(raw_query):
-    q = str(raw_query or "").strip()
-    if not q:
-        return None
-
-    user = User.query.filter(db.func.lower(User.user_id) == q.lower()).first()
-    if user:
-        return user
-
-    norm_phone = normalize_phone(q)
-    if norm_phone:
-        user = User.query.filter_by(phone=norm_phone).first()
-        if user:
-            return user
-
-    digits_only = re.sub(r"\D", "", q)
-    if digits_only:
-        all_users = User.query.all()
-        for u in all_users:
-            u_digits = re.sub(r"\D", "", str(u.phone or ""))
-            uid_digits = re.sub(r"\D", "", str(u.user_id or ""))
-            if (u_digits and (u_digits == digits_only or u_digits.endswith(digits_only) or digits_only.endswith(u_digits))) or (uid_digits and uid_digits == digits_only):
-                return u
-
-    return User.query.filter(db.func.lower(User.name).contains(q.lower())).first()
-
-
 def _process_direct_login(data):
     raw_name = str(
         data.get('name') or data.get('username') or data.get('display_name') or data.get('displayName') or ''
@@ -291,13 +274,13 @@ def health_check():
 # 🔐 डायरेक्ट Username + User ID लॉगिन राउट (बिना OTP)
 @app.route('/api/auth/login', methods=['POST'])
 def auth_login():
-    return _process_direct_login(request.json or {})
+    return _process_direct_login(request.get_json(silent=True) or {})
 
 
 # 👤 यूजर रजिस्ट्रेशन / डायरेक्ट लॉगिन राउट
 @app.route('/api/users/register', methods=['POST'])
 def register_user():
-    data = request.json or {}
+    data = request.get_json(silent=True) or {}
     if not data.get('name') and not data.get('username') and not data.get('display_name') and not data.get('displayName') and data:
         keys = list(data.keys())
         if len(keys) > 1 and not data.get('user_id') and not data.get('userId'):
@@ -310,7 +293,7 @@ def register_user():
 # 🖼️ प्रोफाइल फोटो / नाम अपडेट राउट
 @app.route('/api/users/profile', methods=['POST', 'PUT'])
 def update_profile():
-    data = request.json or {}
+    data = request.get_json(silent=True) or {}
     uid = str(data.get('user_id') or data.get('userId') or '').strip()
     phone = normalize_phone(str(data.get('phone') or '').strip())
     name = data.get('name')
@@ -413,7 +396,7 @@ def admin_webhook_event():
 # 📩 मैसेज भेजने और टेलीग्राम पर फॉरवर्ड करने का राउट
 @app.route('/api/messages', methods=['POST'])
 def send_message():
-    data = request.json or {}
+    data = request.get_json(silent=True) or {}
     sender = str(data.get('sender_id') or data.get('senderId') or '').strip()
     receiver = str(data.get('receiver_id') or data.get('receiverId') or '').strip()
     msg_text = str(
@@ -429,7 +412,7 @@ def send_message():
     if not sender or not receiver:
         return jsonify({"error": "sender_id और receiver_id जरूरी हैं।"}), 400
 
-    user_check = User.query.filter_by(user_id=sender).first()
+    user_check = User.query.filter(db.func.lower(User.user_id) == sender.lower()).first()
     if user_check and user_check.is_blocked:
         return jsonify({"error": "You are blocked by the administrator."}), 403
 
@@ -500,7 +483,7 @@ def delete_message(message_id):
 # ✔️ मैसेज रीड करने का राउट
 @app.route('/api/messages/<peer_id>/read', methods=['POST'])
 def mark_conversation_read(peer_id):
-    data = request.json or {}
+    data = request.get_json(silent=True) or {}
     reader_id = str(data.get('user_id') or data.get('userId') or request.args.get('userId') or '').strip()
     query = Message.query.filter(Message.sender_id == peer_id)
     if reader_id:
@@ -510,21 +493,50 @@ def mark_conversation_read(peer_id):
     return jsonify({"status": "success"})
 
 
-# 📁 मीडिया अपलोड राउट
+# 📁 अपलोड की गई मीडिया फ़ाइल्स को सर्व करने का राउट (ताकि दूसरे फोन पर फोटो/वीडियो लोड हो सके)
+@app.route('/uploads/<path:filename>', methods=['GET'])
+def serve_upload(filename):
+    return send_from_directory(UPLOAD_FOLDER, filename)
+
+
+# 📁 मीडिया अपलोड राउट (फ़ाइल या Base64/URL सेव करके असली URL लौटाता है)
 @app.route('/api/media/upload', methods=['POST'])
 def upload_media():
-    if request.files and 'file' in request.files:
-        f = request.files['file']
-        os.makedirs("uploads", exist_ok=True)
-        safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", f.filename or "media.jpg")
-        save_path = os.path.join("uploads", safe_name)
-        f.save(save_path)
-        base_url = request.host_url.rstrip("/")
-        return jsonify({"media_url": f"{base_url}/uploads/{safe_name}", "url": f"{base_url}/uploads/{safe_name}", "type": "image"}), 200
+    base_url = request.host_url.rstrip("/")
 
-    data = request.json or {}
-    url = str(data.get('media_url') or data.get('url') or "https://placeholder-url.com/media.jpg").strip()
-    return jsonify({"media_url": url, "url": url, "type": "image"}), 200
+    if request.files:
+        f = (
+            request.files.get('file')
+            or request.files.get('media')
+            or request.files.get('image')
+            or next(iter(request.files.values()), None)
+        )
+        if f and f.filename:
+            safe_name = f"{int(datetime.utcnow().timestamp() * 1000)}_{re.sub(r'[^A-Za-z0-9._-]', '_', f.filename)}"
+            save_path = os.path.join(UPLOAD_FOLDER, safe_name)
+            f.save(save_path)
+            full_url = f"{base_url}/uploads/{safe_name}"
+            ext = os.path.splitext(safe_name)[1].lower()
+            m_type = "video" if ext in (".mp4", ".mov", ".mkv", ".webm", ".3gp", ".avi") else "image"
+            return jsonify({
+                "media_url": full_url,
+                "mediaUrl": full_url,
+                "url": full_url,
+                "type": m_type
+            }), 200
+
+    data = request.get_json(silent=True) or {}
+    raw_url = str(data.get('media_url') or data.get('mediaUrl') or data.get('url') or '').strip()
+    if raw_url.startswith("http://") or raw_url.startswith("https://") or raw_url.startswith("/uploads/"):
+        final_url = f"{base_url}{raw_url}" if raw_url.startswith("/") else raw_url
+        return jsonify({
+            "media_url": final_url,
+            "mediaUrl": final_url,
+            "url": final_url,
+            "type": str(data.get('type') or "image")
+        }), 200
+
+    return jsonify({"error": "मान्य मीडिया फ़ाइल या URL प्राप्त नहीं हुआ।"}), 400
 
 
 # 🌐 WebRTC ICE Servers राउट
@@ -533,15 +545,129 @@ def get_ice_servers():
     return jsonify({
         "ice_servers": [
             {"urls": "stun:stun.l.google.com:19302"},
-            {"urls": "stun:stun1.l.google.com:19302"}
+            {"urls": "stun:stun1.l.google.com:19302"},
+            {"urls": "stun:stun2.l.google.com:19302"}
         ]
     }), 200
+
+
+# 📞 कॉल सिग्नल भेजने का राउट (ऑडियो/वीडियो कॉल रिंग, offer, answer, ice, decline, hangup)
+@app.route('/api/calls/signal', methods=['POST'])
+def push_call_signal():
+    data = request.get_json(silent=True) or {}
+    to_user = str(
+        data.get('to') or data.get('to_user_id') or data.get('toUserId') or
+        data.get('receiver_id') or data.get('receiverId') or data.get('target_user_id') or ''
+    ).strip()
+    from_user = str(
+        data.get('from') or data.get('from_user_id') or data.get('fromUserId') or
+        data.get('sender_id') or data.get('senderId') or data.get('caller_id') or ''
+    ).strip()
+    sig_type = str(
+        data.get('type') or data.get('event') or data.get('action') or data.get('signal_type') or 'offer'
+    ).strip()
+    call_id = str(data.get('call_id') or data.get('callId') or f"call_{from_user}_{to_user}").strip()
+    is_video = bool(data.get('is_video') if data.get('is_video') is not None else data.get('video', False))
+
+    if not to_user:
+        return jsonify({"error": "to_user_id जरूरी है।"}), 400
+
+    caller_row = User.query.filter(db.func.lower(User.user_id) == from_user.lower()).first() if from_user else None
+    caller_name = str(
+        data.get('caller_name') or data.get('callerName') or data.get('from_name') or
+        (caller_row.name if caller_row else "") or from_user
+    ).strip()
+
+    payload = dict(data)
+    payload["type"] = sig_type
+    payload["signal_type"] = sig_type
+    payload["from"] = from_user
+    payload["from_user_id"] = from_user
+    payload["fromUserId"] = from_user
+    payload["caller_id"] = from_user
+    payload["callerName"] = caller_name
+    payload["caller_name"] = caller_name
+    payload["to"] = to_user
+    payload["to_user_id"] = to_user
+    payload["toUserId"] = to_user
+    payload["receiver_id"] = to_user
+    payload["call_id"] = call_id
+    payload["callId"] = call_id
+    payload["is_video"] = is_video
+    payload["video"] = is_video
+    payload["timestamp"] = datetime.utcnow().isoformat()
+
+    with CALL_LOCK:
+        target_key = to_user.lower()
+        CALL_SIGNALS.setdefault(target_key, []).append(payload)
+
+        if sig_type.lower() in ("offer", "call_invite", "incoming_call", "ringing"):
+            ACTIVE_CALLS[call_id] = {
+                "call_id": call_id,
+                "from_user_id": from_user,
+                "caller_name": caller_name,
+                "to_user_id": to_user,
+                "is_video": is_video,
+                "status": "ringing",
+                "updated_at": payload["timestamp"]
+            }
+        elif sig_type.lower() in ("answer", "accept", "accepted"):
+            if call_id in ACTIVE_CALLS:
+                ACTIVE_CALLS[call_id]["status"] = "connected"
+                ACTIVE_CALLS[call_id]["updated_at"] = payload["timestamp"]
+        elif sig_type.lower() in ("hangup", "end", "ended", "decline", "declined", "reject", "rejected", "busy", "cancel"):
+            ACTIVE_CALLS.pop(call_id, None)
+
+    return jsonify({
+        "status": "queued",
+        "call_id": call_id,
+        "signal": payload
+    }), 200
+
+
+# 📞 दूसरे फोन के लिए इनकमिंग कॉल / कॉल सिग्नल रिसीव करने का राउट
+@app.route('/api/calls/poll', methods=['GET'])
+def poll_call_signals():
+    uid = str(
+        request.args.get('user_id') or request.args.get('userId') or request.args.get('id') or ''
+    ).strip()
+    if not uid:
+        return jsonify({"signals": [], "calls": [], "incoming_call": None}), 200
+
+    uid_lower = uid.lower()
+    with CALL_LOCK:
+        signals = CALL_SIGNALS.pop(uid_lower, [])
+        incoming = None
+        for call in ACTIVE_CALLS.values():
+            if str(call.get("to_user_id") or "").lower() == uid_lower and call.get("status") == "ringing":
+                incoming = call
+                break
+
+    return jsonify({
+        "signals": signals,
+        "calls": signals,
+        "incoming_call": incoming
+    }), 200
+
+
+# 📞 किसी यूजर के लिए सक्रिय इनकमिंग कॉल स्टेटस देखने का राउट
+@app.route('/api/calls/active', methods=['GET'])
+def active_call_status():
+    uid = str(
+        request.args.get('user_id') or request.args.get('userId') or ''
+    ).strip().lower()
+    with CALL_LOCK:
+        matching = [
+            c for c in ACTIVE_CALLS.values()
+            if (not uid or str(c.get("to_user_id") or "").lower() == uid or str(c.get("from_user_id") or "").lower() == uid)
+        ]
+    return jsonify({"calls": matching, "incoming_call": matching[0] if matching else None}), 200
 
 
 # 🤖 टेलीग्राम वेबहुक (ब्लॉक/अनब्लॉक बटन + /history कमांड)
 @app.route('/telegram_webhook', methods=['POST'])
 def telegram_webhook():
-    update = request.json or {}
+    update = request.get_json(silent=True) or {}
     if "callback_query" in update:
         callback = update["callback_query"]
         data = callback["data"]
